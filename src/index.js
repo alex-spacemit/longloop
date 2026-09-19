@@ -14,6 +14,7 @@
 
 import { readFile, writeFile, readdir, mkdir, rm, stat, rename, readlink } from 'node:fs/promises'
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join, resolve, sep, basename } from 'node:path'
 
 import { budgetReport, escalationFor, renderContractBlock, renderRecoveryBlock, renderRoundPrompt, runSummary } from './governors.js'
@@ -36,6 +37,7 @@ import { buildHandoff, extractRisks } from './handoff.js'
 import { extractConstraints, mergeConstraints } from './context.js'
 import { installRunCommands } from './commands.js'
 import { computeMetrics, renderMetrics } from './metrics.js'
+import { buildEvidence, evidenceCoverage, renderEvidenceSummary, resolveCitedIds } from './evidence.js'
 import { runDiagnosis, renderFreshRoundPrompt, freshRoundLedgerEntry, runFreshRound as startFreshRound } from './escalate.js'
 import {
   emitLongloop,
@@ -2068,12 +2070,87 @@ function registerRunTools(ctx) {
       },
     },
     {
+      name: 'run_evidence',
+      description:
+        'Register evidence for the claim you are about to make: point at a file, a command, a URL, a commit, or an observation, and say which acceptance criteria it addresses. The framework hashes the artifact (a file by content, anything else by pointer), so a later reader can tell whether the evidence still stands. Registering evidence is what lets run_finish cite it by id.',
+      parameters: objectSchema({
+        kind: { type: 'string', enum: ['file', 'command', 'url', 'commit', 'observation'], required: true, description: 'What kind of thing the pointer points at.' },
+        pointer: { type: 'string', required: true, description: 'The artifact itself: a workspace path, a command, a URL, a commit sha, or a short description.' },
+        addresses: { type: 'array', items: { type: 'string' }, description: 'Criterion ids (C1, C2…) this evidence speaks to. Empty is allowed but reported.' },
+        note: { type: 'string', description: 'Optional: what this evidence shows.' },
+      }),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            hashOf: { type: 'string' },
+            coverage: { type: 'object' },
+            note: { type: 'string' },
+          },
+        },
+        render: (_args, value) => text(value.note),
+      },
+      async execute(args, exec) {
+        const root = rootFor(exec)
+        const dir = longloopDir(root)
+        const run = readRunSync(dir)
+        if (run === undefined) throw new Error('这个工作区还没有运行；证据是运行的一部分，先 run_start。')
+
+        const criteria = parseChecks(run.contract)
+        // Hash the artifact when it is a real file in the workspace, and say so;
+        // hashing the *pointer* for everything else keeps the field honest rather
+        // than dressing a string up as a content digest.
+        let hash = { hashOf: 'pointer', hash: '' }
+        if (args.kind === 'file') {
+          const relative = String(args.pointer).replace(/^\/+/, '')
+          try {
+            const content = await readFile(join(root, relative))
+            hash = { hashOf: 'file', hash: createHash('sha256').update(content).digest('hex') }
+          } catch {
+            hash = { hashOf: 'pointer', hash: createHash('sha256').update(String(args.pointer)).digest('hex') }
+          }
+        } else {
+          hash = { hashOf: 'pointer', hash: createHash('sha256').update(String(args.pointer)).digest('hex') }
+        }
+
+        const built = buildEvidence(run.evidence ?? [], args, {
+          criteria,
+          round: run.round,
+          at: Date.now(),
+          hash,
+        })
+        if (built.error !== undefined) throw new Error(built.error)
+
+        const records = [...(run.evidence ?? []), built.record].slice(-200)
+        await patchRun(dir, exists, { evidence: records })
+        await recordLedger(ctx, dir, run, {
+          kind: 'evidence',
+          runId: run.id,
+          round: run.round,
+          id: built.record.id,
+          evidenceKind: built.record.kind,
+          pointer: built.record.pointer,
+          hashOf: built.record.hashOf,
+          addresses: built.record.addresses.join(','),
+        })
+        emitLongloop(ctx, run, LONGLOOP_EVENT.ledger, ledgerEventData(run, { kind: 'evidence', round: run.round, detail: `${built.record.id} ${built.record.pointer}` }))
+        const coverage = evidenceCoverage(records, criteria)
+        return {
+          id: built.record.id,
+          hashOf: built.record.hashOf,
+          coverage,
+          note: renderEvidenceSummary(built.record, coverage),
+        }
+      },
+    },
+    {
       name: 'run_finish',
       description:
         'Claim the run is complete. This does NOT end the run: it submits the claim for verification against the frozen acceptance criteria. Stating completion is never what completes it.',
       parameters: objectSchema({
         summary: { type: 'string', required: true, description: 'What was achieved and how you verified it.' },
-        evidence: { type: 'array', items: { type: 'string' }, description: 'Paths or commands that demonstrate it.' },
+        evidence: { type: 'array', items: { type: 'string' }, description: 'Free-text pointers, or evidence ids (E1, E2…) registered with run_evidence.' },
       }),
       output: {
         schema: { type: 'object', properties: { submitted: { type: 'boolean' }, note: { type: 'string' } } },
@@ -2081,16 +2158,34 @@ function registerRunTools(ctx) {
       },
       async execute(args, exec) {
         const root = rootFor(exec)
-        const evidence = args.evidence ?? []
+        const dir = longloopDir(root)
+        const run = readRunSync(dir)
+        const evidence = (args.evidence ?? []).map(String)
+        // §10.2: a claim cites evidence *ids*. An id that was never registered is a
+        // typo, not evidence, so the two are separated before anything is counted.
+        const registered = run?.evidence ?? []
+        const citedIds = evidence.filter((item) => /^E\d+$/.test(item.trim()))
+        const { found, missing } = resolveCitedIds(registered, citedIds)
+        const missingEvidence = missing
+        const freeText = evidence.filter((item) => !/^E\d+$/.test(item.trim()))
+
         await handleRun(ctx, root, { op: 'note', kind: 'claim', detail: args.summary })
-        for (const item of evidence) {
-          await handleRun(ctx, root, { op: 'note', kind: 'evidence', detail: String(item) })
+        for (const record of found) {
+          await handleRun(ctx, root, { op: 'note', kind: 'evidence', detail: `${record.id} ${record.kind} ${record.pointer}` })
+        }
+        for (const item of freeText) {
+          await handleRun(ctx, root, { op: 'note', kind: 'evidence', detail: item })
+        }
+        if (missing.length > 0) {
+          await appendLedger(dir, { kind: 'evidence-missing', runId: run?.id, round: run?.round, ids: missing })
         }
         exec?.concludeTurn?.()
 
         const result = await verifyRun(ctx, root, {
           claim: args.summary,
-          evidenceCount: evidence.length,
+          evidenceCount: found.length + freeText.length,
+          evidenceIds: found.map((record) => record.id),
+          evidenceMissing: missing,
         })
         if (result.ok === false) throw new Error(result.error)
 
@@ -2099,6 +2194,7 @@ function registerRunTools(ctx) {
             submitted: false,
             challenged: true,
             note:
+              (missingEvidence.length === 0 ? '' : `引用里这些 id 没有登记过：${missingEvidence.join(', ')}（用 run_evidence 先登记）。\n`) +
               `这份声明目前无法被审计（第 ${result.attempt}/${result.max} 次）：\n` +
               result.reasons.map((r) => `· ${r.detail}`).join('\n') +
               '\n请在下一轮补上可执行的检查或具体证据，再重新提交。',
@@ -2110,6 +2206,9 @@ function registerRunTools(ctx) {
           `裁决 ${verdict.id} · ${verdict.status} · ${verdict.level}`,
           ...verdict.perCriterion.map((c) => `[${c.status}] ${c.id} ${c.statement} —— ${c.note}`),
         ]
+        if (missingEvidence.length > 0) {
+          lines.push(`注意：引用里这些证据 id 没有登记过，没有计入证据数：${missingEvidence.join(', ')}`)
+        }
         if (verdict.counterexamples.length > 0) {
           lines.push('反例：', ...verdict.counterexamples.map((e) => `· ${e}`))
         }

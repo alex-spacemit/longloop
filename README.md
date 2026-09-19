@@ -70,9 +70,9 @@ From the console, or from the composer:
   own judge, and the console says so.
 - `--rounds N`, `--deliverable 文字`.
 
-The model drives the same lifecycle through eight tools, matching the design's tool surface:
-`run_start`, `run_plan`, `run_note`, `run_status`, `run_verify`, `run_finish`, `run_block`,
-`run_handoff`.
+The model drives the same lifecycle through the design's nine tools:
+`run_start`, `run_plan`, `run_note`, `run_evidence`, `run_status`, `run_verify`, `run_finish`,
+`run_block`, `run_handoff`.
 
 Two of them are worth knowing about:
 
@@ -80,6 +80,11 @@ Two of them are worth knowing about:
   (`addresses: ["C1"]`). A task that addresses nothing is rejected, ids the contract does not
   have are rejected, and the reply names the criteria no task covers — a plan is graded by the
   contract, not by itself.
+- **`run_evidence(kind, pointer, addresses)`** registers what a claim rests on — a file, a command,
+  a URL, a commit, an observation — with the criteria it speaks to. The framework hashes the
+  artifact (a file by content, anything else by pointer, and the record says which), and the reply
+  names the criteria that still have no evidence. `run_finish` then cites evidence by id, and an id
+  that was never registered is reported rather than counted.
 - **`run_verify(criteria?)`** runs the gate on demand. Without arguments it is the real gate: if
   every required criterion passes, the run completes. With `criteria` it validates only those and
   *cannot* complete the run, which is the point — a subset answer is not a completion.
@@ -106,7 +111,7 @@ build step.
 ```bash
 npm run build      # src/ → lib/ (byte for byte)
 npm run check      # verify lib/ is in sync, then run the test suite
-npm test           # 251 tests, no dependencies beyond Node's test runner
+npm test           # 263 tests, no dependencies beyond Node's test runner
 ```
 
 The plugin is **dependency-free** ESM JavaScript: it uses only Node built-ins and the
@@ -123,9 +128,7 @@ events + projections, the console, and metrics.
 
 Known gaps, kept visible rather than implied by the absence of a note:
 
-- `run_evidence` is not implemented: the design's evidence registry (kind, pointer, addressed
-  criteria, framework-computed hash) would let a claim cite evidence ids, and today the gate
-  counts evidence rather than resolving it.
+- The verification sandbox is in-place with quarantine rules, not a copied workspace.
 - No control group. The metrics describe the system as it is; they do not measure what the
   governance adds (§12 says so in the report itself).
 - The verification sandbox is in-place with quarantine rules, not a copied workspace.

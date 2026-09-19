@@ -488,7 +488,7 @@ test('run: an unchanged workspace scores a stall, and the escalation climbs', as
 
 test('the run tools are registered, and a tool-shape change cannot kill the console', async () => {
   const names = hooks.tools.map((t) => t.name).sort()
-  assert.deepEqual(names, ['run_block', 'run_finish', 'run_handoff', 'run_note', 'run_plan', 'run_start', 'run_status', 'run_verify'])
+  assert.deepEqual(names, ['run_block', 'run_evidence', 'run_finish', 'run_handoff', 'run_note', 'run_plan', 'run_start', 'run_status', 'run_verify'])
 
   for (const tool of hooks.tools) {
     assert.ok(tool.description.length > 40, `${tool.name} needs a description the model can act on`)
@@ -1110,4 +1110,62 @@ test('a handoff carries the latest verdict, including a requested one', async ()
   // ...and the one that was not checked says so rather than borrowing the news.
   assert.match(value.document, /\| C2 \| 有摘要 \| 必达 \| ⚠️ 未验证 \|/)
   assert.match(value.document, /\*\*终态\*\*: armed(?! —— 验收标准全部通过)/)
+})
+
+/* ────────────────────────── §10.2: the evidence registry ────────────────── */
+
+test('run_evidence registers a hashed artifact and reports coverage', async () => {
+  const { byName, exec } = await withTools()
+  await startRun(byName, exec)
+  await writeFile(join(workspace, 'report.md'), '结果表\n', 'utf8')
+
+  const first = await byName('run_evidence').execute(
+    { kind: 'file', pointer: 'report.md', addresses: ['C1'], note: '结果表就在这里' },
+    exec(),
+  )
+  assert.equal(first.id, 'E1')
+  assert.equal(first.hashOf, 'file', 'a real file is hashed by content')
+  assert.deepEqual(first.coverage.covered, ['C1'])
+  assert.deepEqual(first.coverage.missing, ['C2'])
+  assert.match(first.note, /已登记证据 E1 · file · report\.md/)
+
+  // The hash is of the content: same pointer, changed content, different hash.
+  const record = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8')).evidence[0]
+  await writeFile(join(workspace, 'report.md'), '结果表（改过）\n', 'utf8')
+  const second = await byName('run_evidence').execute({ kind: 'file', pointer: 'report.md', addresses: ['C1'] }, exec())
+  const records = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8')).evidence
+  assert.equal(second.id, 'E2')
+  assert.notEqual(records[1].hash, record.hash, 'the content digest follows the content')
+
+  // A non-file pointer hashes the pointer, and says so.
+  const third = await byName('run_evidence').execute({ kind: 'command', pointer: 'node --test', addresses: ['C2'] }, exec())
+  assert.equal(third.hashOf, 'pointer')
+  assert.deepEqual(third.coverage.missing, [])
+})
+
+test('run_evidence refuses unknown criteria and missing kinds', async () => {
+  const { byName, exec } = await withTools()
+  await startRun(byName, exec)
+  await assert.rejects(() => byName('run_evidence').execute({ kind: 'file', pointer: 'x', addresses: ['C9'] }, exec()), /C9/)
+  await assert.rejects(() => byName('run_evidence').execute({ kind: 'vibe', pointer: 'x' }, exec()), /kind/)
+})
+
+test('run_finish counts registered evidence and names ids it never saw', async () => {
+  const { byName, exec, hooks: local } = await withTools()
+  await startRun(byName, exec)
+  await byName('run_evidence').execute({ kind: 'observation', pointer: '手工核对了输出', addresses: ['C1'] }, exec())
+  const value = await byName('run_finish').execute(
+    { summary: '写完了', evidence: ['E1', 'E7', 'src/auth/store.ts'] },
+    exec(),
+  )
+  assert.equal(value.submitted, true)
+  assert.match(value.note, /E7/)
+  assert.match(value.note, /没有登记过/)
+
+  const notes = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8')).notes ?? []
+  assert.ok(notes.some((note) => note.detail.startsWith('E1 ')), 'the cited id travels into the claim notes')
+  assert.ok(notes.some((note) => note.detail === 'src/auth/store.ts'), 'free text is still recorded')
+  const ledger = await readFile(join(workspace, '.longloop/ledger.jsonl'), 'utf8')
+  assert.match(ledger, /"kind":"evidence-missing"/)
+  assert.ok(local.tools.some((definition) => definition.name === 'run_evidence'))
 })
