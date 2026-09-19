@@ -1228,7 +1228,16 @@ async function writeHandoff(ctx, root, reason) {
     const run = await readRun(dir, exists)
     if (run === undefined) return undefined
     const [board, ledger] = await Promise.all([readTasks(root), readLedger(dir, 500)])
-    const document = buildHandoff({ run, ledger, verdict: run.lastVerdict, tasks: board.tasks })
+    // A requested (subset) verdict is not a completion verdict, but it is still
+    // the latest thing known about the criteria — a handoff that says "本轮未产生
+    // 裁决" while a check just failed would be less honest than the run.
+    const latest = run.lastVerdict ?? run.lastRequestedVerdict
+    const document = buildHandoff({
+      run,
+      ledger,
+      verdict: latest === undefined ? undefined : { ...latest, scope: latest.scope ?? (run.lastVerdict === undefined ? 'requested' : 'completion') },
+      tasks: board.tasks,
+    })
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, `${run.id}-handoff.md`), document, 'utf8')
     await patchRun(dir, exists, { handoff: { at: Date.now(), reason, path: join('.longloop', `${run.id}-handoff.md`) } })

@@ -1045,3 +1045,26 @@ test('run_handoff writes the package, returns it, and concludes the turn', async
   const state = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
   assert.equal(state.handoff.reason, 'on-demand')
 })
+
+test('a handoff carries the latest verdict, including a requested one', async () => {
+  // A run whose only evidence is a subset verdict must not hand off as
+  // "no verdict this round": that would hide the check that just failed.
+  const { byName, exec } = await withTools({ 'test -f report.md': { exitCode: 1, stdout: 'missing' } })
+  const run = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
+  await writeFile(
+    join(workspace, '.longloop/run.json'),
+    `${JSON.stringify(
+      { ...run, state: 'armed', endedAt: undefined, endReason: undefined, lastVerdict: undefined, lastRequestedVerdict: undefined },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  )
+  await byName('run_verify').execute({ criteria: ['C1'] }, exec())
+  const value = await byName('run_handoff').execute({}, exec())
+  // The criterion that was checked carries its failure...
+  assert.match(value.document, /\| C1 \| 报告存在 \| 必达 \| ❌ fail \| 退出码 1，期望 0 \|/)
+  // ...and the one that was not checked says so rather than borrowing the news.
+  assert.match(value.document, /\| C2 \| 有摘要 \| 必达 \| ⚠️ 未验证 \|/)
+  assert.match(value.document, /\*\*终态\*\*: armed(?! —— 验收标准全部通过)/)
+})
