@@ -1508,6 +1508,14 @@ async function verifyRun(ctx, root, options = {}) {
   // the sandbox-aware host service, while the quarantine scan asks Node about
   // the real directory (see `SCAN_FS`).
   const checkFs = ctx.get('fs')
+  // §10.2 `run_verify` may ask about a subset. A subset answer is a *statement
+  // about those criteria only*: it can never be a completion verdict, so the
+  // narrowed pass is routed to the process scope and cannot end the run.
+  const only = Array.isArray(options.only) && options.only.length > 0 ? options.only.map(String) : undefined
+  const scoped = only === undefined ? undefined : parseChecks(run.contract).filter((check) => only.includes(check.id))
+  if (only !== undefined && (scoped === undefined || scoped.length === 0)) {
+    return { ok: false, error: `run_verify 的 criteria 没匹配到任何标准：${only.join(', ')}` }
+  }
   // Fingerprint the tree before and after: not to fail a check that writes cache
   // files, but to bind the evidence to the exact tree it was produced against.
   const before = await digestWorkspace(root)
@@ -1536,6 +1544,7 @@ async function verifyRun(ctx, root, options = {}) {
     signal: options.signal,
     quarantine,
     digest: () => before.digest,
+    ...(only === undefined ? {} : { only, scope: 'requested' }),
   })
   const after = await digestWorkspace(root)
   verdict.digestAfter = after.digest
@@ -1573,12 +1582,13 @@ async function verifyRun(ctx, root, options = {}) {
 
   // `partial` means every *required* criterion passed and only nice-to-have
   // ones are unresolved — which is what the contract asked for, so it completes.
-  // `unknown` and `fail` do not.
-  const completed = finalVerdict.status === 'pass' || finalVerdict.status === 'partial'
+  // `unknown` and `fail` do not. A narrowed request (`only`) completes nothing:
+  // it never claimed to be about the whole contract.
+  const completed = only === undefined && (finalVerdict.status === 'pass' || finalVerdict.status === 'partial')
   const settled = await patchRun(dir, exists, {
     verdicts: [...verdicts, finalVerdict].slice(-50),
     challenges: 0,
-    lastVerdict: finalVerdict,
+    ...(only === undefined ? { lastVerdict: finalVerdict } : { lastRequestedVerdict: finalVerdict }),
     ...(completed ? { state: 'done', endedAt: Date.now(), endReason: '验收标准全部通过' } : {}),
   })
   await recordLedger(ctx, dir, run, {
@@ -2064,6 +2074,194 @@ function registerRunTools(ctx) {
         emitRunState(ctx, blocked, { reason: 'blocked' })
         exec?.concludeTurn?.()
         return { reported: true, note: `已上报阻塞：${args.blocker}。运行已转入 blocked，等待人工处理。` }
+      },
+    },
+    {
+      name: 'run_plan',
+      description:
+        'Replace the run plan. Each task must say which acceptance criterion it addresses — a plan whose tasks address nothing is a list of intentions, and the run will be graded by the contract, not by the list.',
+      parameters: objectSchema({
+        tasks: {
+          type: 'array',
+          required: true,
+          description: 'The whole plan, in order: passing it replaces the previous one.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Stable id (T1, T2…). Omit to have one minted.' },
+              title: { type: 'string', required: true, description: 'One line: what this task finishes.' },
+              addresses: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Criterion ids from the contract (C1, C2…) this task contributes to. At least one.',
+              },
+              priority: { type: 'number', description: 'P0 (highest) to P3. Defaults to P2.' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'blocked', 'done'], description: 'Defaults to pending.' },
+              note: { type: 'string', description: 'Anything the next round needs to know about this task.' },
+            },
+          },
+        },
+      }),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            planned: { type: 'number' },
+            tasks: { type: 'array', items: { type: 'object' } },
+            uncovered: { type: 'array', items: { type: 'string' } },
+            note: { type: 'string' },
+          },
+        },
+        render: (_args, value) => text(value.note),
+      },
+      async execute(args) {
+        const root = workspaceOf(ctx)
+        const dir = longloopDir(root)
+        const run = readRunSync(dir)
+        if (run === undefined) throw new Error('这个工作区还没有运行，先 run_start。')
+        const requested = Array.isArray(args.tasks) ? args.tasks : []
+        if (requested.length === 0) throw new Error('run_plan 需要一个非空的 tasks 数组；要清空计划请说明原因。')
+
+        const criteria = parseChecks(run.contract)
+        const ids = new Set(criteria.map((criterion) => criterion.id))
+        const board = await readTasks(root)
+        const tasks = []
+        for (const entry of requested) {
+          const title = String(entry?.title ?? '').trim()
+          if (title.length === 0) throw new Error('每个 task 都需要 title。')
+          const addresses = (Array.isArray(entry.addresses) ? entry.addresses : []).map(String)
+          if (addresses.length === 0) {
+            throw new Error(`任务「${title}」没有 addresses：每个任务至少要对应一条验收标准（${[...ids].join(', ') || '本运行没有可判定的标准'}）。`)
+          }
+          const unknown = addresses.filter((id) => !ids.has(id))
+          if (unknown.length > 0) {
+            throw new Error(`任务「${title}」引用了契约里不存在的标准：${unknown.join(', ')}。契约开工即冻结，标准不能新增。`)
+          }
+          const existing = tasks.find((task) => task.id === String(entry.id ?? '')) ?? board.tasks.find((task) => task.id === String(entry.id ?? ''))
+          tasks.push({
+            id: existing?.id ?? nextTaskId([...board.tasks, ...tasks]),
+            title,
+            status: STATUSES.has(entry.status) ? entry.status : 'pending',
+            priority: clampPriority(entry.priority, 2),
+            scope: addresses,
+            note: typeof entry.note === 'string' ? entry.note : '',
+            createdAt: existing?.createdAt ?? Date.now(),
+            updatedAt: Date.now(),
+            revision: (existing?.revision ?? 0) + 1,
+          })
+        }
+        await writeTasks(root, { version: 1, tasks })
+
+        const covered = new Set(tasks.flatMap((task) => task.scope))
+        const uncovered = criteria.filter((criterion) => !covered.has(criterion.id)).map((criterion) => criterion.id)
+        await recordLedger(ctx, dir, run, {
+          kind: 'plan',
+          runId: run.id,
+          round: run.round,
+          tasks: tasks.length,
+          covered: covered.size,
+          uncovered: uncovered.length,
+        })
+        emitLongloop(ctx, run, LONGLOOP_EVENT.run, runEventData(run, { reason: 'plan-replaced', tasks: tasks.length }))
+        return {
+          planned: tasks.length,
+          tasks: tasks.map((task) => ({ id: task.id, title: task.title, addresses: task.scope, priority: task.priority, status: task.status })),
+          uncovered,
+          note:
+            `计划已替换：${tasks.length} 个任务，覆盖 ${covered.size}/${criteria.length} 条标准。` +
+            (uncovered.length === 0
+              ? '每条标准都有任务对应。'
+              : `注意：${uncovered.join(', ')} 还没有任何任务对应 —— 验收时它们不会因为你做了别的而通过。`),
+        }
+      },
+    },
+    {
+      name: 'run_verify',
+      description:
+        'Run the verification gate now. Without `criteria` it is the real gate: if every required criterion passes, the run completes. With `criteria` it validates only those ids and cannot complete the run — use it mid-flight to check one thing before building on it.',
+      parameters: objectSchema({
+        criteria: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Criterion ids to verify (C1, C2…). Omit to run the whole contract.',
+        },
+      }),
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            status: { type: 'string' },
+            level: { type: 'string' },
+            completed: { type: 'boolean' },
+            perCriterion: { type: 'array', items: { type: 'object' } },
+            nextActions: { type: 'array', items: { type: 'string' } },
+            note: { type: 'string' },
+          },
+        },
+        render: (_args, value) => text(value.note),
+      },
+      async execute(args, exec) {
+        const root = rootFor(exec)
+        const result = await verifyRun(ctx, root, {
+          only: Array.isArray(args.criteria) ? args.criteria : undefined,
+          claim: 'run_verify 主动请求',
+        })
+        if (result.ok === false) throw new Error(result.error)
+        if (result.challenged === true) {
+          return {
+            status: 'challenged',
+            level: 'gate',
+            completed: false,
+            perCriterion: [],
+            nextActions: result.reasons.map((reason) => reason.detail ?? reason.code),
+            note: `验证门要求先补齐证据（第 ${result.attempt}/${result.max} 次）：\n` + result.reasons.map((reason) => `· ${reason.detail ?? reason.code}`).join('\n'),
+          }
+        }
+        const verdict = result.verdict
+        const lines = (verdict.perCriterion ?? []).map(
+          (criterion) => `[${criterion.status}] ${criterion.id} ${criterion.statement} —— ${criterion.note}`,
+        )
+        return {
+          status: String(verdict.status ?? 'unknown'),
+          level: String(verdict.level ?? 'executable'),
+          completed: result.completed === true,
+          perCriterion: (verdict.perCriterion ?? []).map((criterion) => ({
+            id: String(criterion.id ?? ''),
+            status: String(criterion.status ?? ''),
+            statement: String(criterion.statement ?? ''),
+            note: String(criterion.note ?? ''),
+          })),
+          nextActions: (verdict.nextActions ?? []).map(String),
+          note:
+            `${verdict.id} · ${verdict.status} · ${verdict.level}\n${lines.join('\n')}\n` +
+            (result.completed === true
+              ? '全部必达标准通过，运行结束。'
+              : '这不是完成：按上面的失败项继续，不要重述结论。'),
+        }
+      },
+    },
+    {
+      name: 'run_handoff',
+      description:
+        'Write the handoff package for this run: objective, contract, what was verified, what was tried and rejected, open risks, and where things stand. Use it when you are about to stop — or when a human asks where the run stands.',
+      parameters: objectSchema({}),
+      output: {
+        schema: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, document: { type: 'string' } } },
+        render: (_args, value) => text(value.document),
+      },
+      async execute(_args, exec) {
+        const root = rootFor(exec)
+        const document = await writeHandoff(ctx, root, 'on-demand')
+        if (document === undefined) {
+          throw new Error('写不出交接包：这个工作区没有运行，或者写入失败（见 host 日志）。')
+        }
+        const run = readRunSync(longloopDir(root))
+        exec?.concludeTurn?.()
+        return {
+          path: join('.longloop', `${run?.id ?? 'run'}-handoff.md`),
+          bytes: Buffer.byteLength(document, 'utf8'),
+          document,
+        }
       },
     },
   ]

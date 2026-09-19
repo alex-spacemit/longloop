@@ -486,9 +486,9 @@ test('run: an unchanged workspace scores a stall, and the escalation climbs', as
 
 /* ──────────────────────────── the run tools ────────────────────────────── */
 
-test('the five run tools are registered, and a tool-shape change cannot kill the console', async () => {
+test('the run tools are registered, and a tool-shape change cannot kill the console', async () => {
   const names = hooks.tools.map((t) => t.name).sort()
-  assert.deepEqual(names, ['run_block', 'run_finish', 'run_note', 'run_start', 'run_status'])
+  assert.deepEqual(names, ['run_block', 'run_finish', 'run_handoff', 'run_note', 'run_plan', 'run_start', 'run_status', 'run_verify'])
 
   for (const tool of hooks.tools) {
     assert.ok(tool.description.length > 40, `${tool.name} needs a description the model can act on`)
@@ -915,4 +915,133 @@ test('verification gets its own budget dimension when tokens are budgeted', asyn
   assert.ok(names.includes('verifyTokens'), `verification must not share the execution budget, saw ${names.join(', ')}`)
   const dimension = state.run.budget.dimensions.find((d) => d.name === 'verifyTokens')
   assert.equal(dimension.limit, 40000, '§8.4: verification may spend up to 40% of the execution budget')
+})
+
+/* ───────────────── §10.2: the three tools beyond the first five ─────────── */
+
+/**
+ * A second, local host: these tests need a shell fixture whose exit codes they
+ * choose (`shellResults`), and they must not disturb the shared `hooks` other
+ * tests use.
+ */
+async function withTools(shellResults = {}) {
+  const { ctx, hooks: local } = makeCtx({ root: workspace, shellResults })
+  apply(ctx, { driver: false })
+  const byName = (name) => {
+    const found = local.tools.find((definition) => definition.name === name)
+    assert.ok(found, `${name} is registered`)
+    return found
+  }
+  return { hooks: local, byName, exec: (overrides = {}) => ({ agent: { id: 'sess-1' }, concludeTurn: () => {}, ...overrides }) }
+}
+
+test('run_plan replaces the plan and refuses tasks that address nothing', async () => {
+  await call('POST', '/longloop/run', { op: 'stop' })
+  await rm(join(workspace, '.longloop/run.json'), { force: true })
+  await rm(join(workspace, '.longloop/tasks.json'), { force: true })
+  const { byName, exec } = await withTools()
+  await byName('run_start').execute(
+    {
+      objective: '把报告写出来',
+      acceptance: [
+        { statement: '报告存在', command: 'test -f report.md' },
+        { statement: '有摘要', command: 'grep -q 摘要 report.md' },
+      ],
+      frozen_paths: ['report.md'],
+      max_rounds: 6,
+    },
+    exec(),
+  )
+
+  const planned = await byName('run_plan').execute(
+    {
+      tasks: [
+        { id: 'T1', title: '写报告', addresses: ['C1'], priority: 0 },
+        { title: '写摘要', addresses: ['C2'], note: '两段就够' },
+      ],
+    },
+    exec(),
+  )
+  assert.equal(planned.planned, 2)
+  assert.deepEqual(planned.uncovered, [])
+  assert.match(planned.note, /覆盖 2\/2 条标准/)
+
+  await assert.rejects(() => byName('run_plan').execute({ tasks: [{ title: '随便做点什么' }] }, exec()), /没有 addresses/)
+  await assert.rejects(
+    () => byName('run_plan').execute({ tasks: [{ title: '多做一件事', addresses: ['C9'] }] }, exec()),
+    /不存在的标准/,
+  )
+
+  // The board is the plan, criterion ids kept in `scope`, order normalised.
+  const board = JSON.parse(await readFile(join(workspace, '.longloop/tasks.json'), 'utf8'))
+  assert.equal(board.tasks.length, 2)
+  assert.deepEqual(board.tasks[0].scope, ['C1'])
+  assert.equal(board.tasks[1].note, '两段就够')
+
+  const partial = await byName('run_plan').execute({ tasks: [{ id: 'T1', title: '只写报告', addresses: ['C1'] }] }, exec())
+  assert.deepEqual(partial.uncovered, ['C2'])
+  assert.match(partial.note, /C2 还没有任何任务对应/)
+})
+
+test('run_verify with criteria checks the subset and cannot complete the run', async () => {
+  const { byName, exec, hooks: local } = await withTools({ 'test -f report.md': { exitCode: 1, stdout: 'missing' } })
+  // A fresh mount suspends armed runs (§4.2 A6), so the run is created *after*
+  // the mount, which is also how a real session gets one.
+  await call('POST', '/longloop/run', { op: 'stop' })
+  await rm(join(workspace, '.longloop/run.json'), { force: true })
+  await byName('run_start').execute(
+    {
+      objective: '子集验证的靶子',
+      acceptance: [
+        { statement: '报告存在', command: 'test -f report.md' },
+        { statement: '有摘要', command: 'grep -q 摘要 report.md' },
+      ],
+    },
+    exec(),
+  )
+  const value = await byName('run_verify').execute({ criteria: ['C1'] }, exec())
+  assert.equal(value.status, 'fail', 'the fixture command exits 1')
+  assert.equal(value.completed, false, 'a subset answer is never a completion')
+  assert.deepEqual(value.perCriterion.map((criterion) => criterion.id), ['C1'])
+  assert.equal(local.shellCalls.at(-1).command, 'test -f report.md')
+  assert.match(value.note, /这不是完成/)
+
+  const state = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
+  assert.equal(state.state, 'armed', 'a subset check leaves the run alone')
+  assert.equal(state.lastVerdict, undefined, 'and does not touch the completion verdict')
+  assert.equal(state.lastRequestedVerdict.status, 'fail')
+
+  await assert.rejects(() => byName('run_verify').execute({ criteria: ['C7'] }, exec()), /没匹配到任何标准/)
+})
+
+test('a full run_verify runs every frozen check and may complete the run', async () => {
+  const { byName, exec, hooks: local } = await withTools()
+  const value = await byName('run_verify').execute({}, exec())
+  assert.equal(local.shellCalls.length, 2, 'both frozen checks ran')
+  assert.equal(value.perCriterion.length, 2)
+  assert.equal(value.completed, true, 'the fixture shell exits 0 for both')
+  assert.match(value.note, /运行结束/)
+  const state = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
+  assert.equal(state.state, 'done')
+  assert.equal(state.lastVerdict.status, 'pass')
+})
+
+test('run_handoff writes the package, returns it, and concludes the turn', async () => {
+  const { byName, exec } = await withTools()
+  let concluded = false
+  const value = await byName('run_handoff').execute({}, exec({ concludeTurn: () => (concluded = true) }))
+  assert.equal(concluded, true, 'the design marks run_handoff as concluding')
+  assert.match(value.path, /\.longloop\/R-[0-9a-f]{6}-handoff\.md/)
+  assert.ok(value.bytes > 100)
+  const onDisk = await readFile(join(workspace, value.path), 'utf8')
+  assert.equal(onDisk, value.document, 'the returned document is the file on disk')
+  const current = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
+  assert.ok(
+    onDisk.includes(current.objective),
+    `the run's own objective (${current.objective}) travels into the handoff`,
+  )
+  assert.ok(onDisk.includes(current.id), 'and so does the run id')
+
+  const state = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
+  assert.equal(state.handoff.reason, 'on-demand')
 })
