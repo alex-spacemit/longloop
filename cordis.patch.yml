@@ -1,0 +1,17 @@
+# LongLoop Console — one row. The Host half registers the authenticated
+# `/longloop` routes, the workspace prompt contexts, the run tools, and (when
+# asked) the round driver; the `dsh.client` field in package.json puts the
+# browser half on the client roster, so no second row is needed.
+#
+# `driver` is false on purpose. Arming a run is already explicit, but a driver
+# that defaults to on would let a restart resume work nobody re-authorised
+# (design §4.2 A6). Turn it on when you want the loop to continue on its own:
+#
+#     - id: longloop-console
+#       config:
+#         driver: true
+- insert:
+    - id: longloop-console
+      name: '@alex-spacemit/dsh-longloop-console'
+      config:
+        driver: false

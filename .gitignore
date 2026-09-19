@@ -1,0 +1,12 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+
+# dsh runtime state — a workspace's run, ledger, tasks and handoffs are data,
+# not source. They live under <workspace>/.longloop/.
+.longloop/
+.dsh/
+
+# macOS
+.DS_Store

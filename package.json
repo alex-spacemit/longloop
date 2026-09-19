@@ -1,0 +1,61 @@
+{
+  "name": "@alex-spacemit/dsh-longloop-console",
+  "version": "0.1.0",
+  "description": "LongLoop Console: contract-frozen long-horizon runs for the DeepSeek Harness (web) — run loop, task board, workspace memory, skills, multi-agent roster, verification gate, and §12 metrics.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "docs/longloop-framework-design.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check:lib": "node scripts/build.mjs --check",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run check:lib && npm run test"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "long-horizon",
+    "agent",
+    "verification"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alex-spacemit/longloop.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
