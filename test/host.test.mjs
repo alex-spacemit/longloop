@@ -924,6 +924,22 @@ test('verification gets its own budget dimension when tokens are budgeted', asyn
  * choose (`shellResults`), and they must not disturb the shared `hooks` other
  * tests use.
  */
+/** A run of one's own: these tests share a workspace, so none may inherit state. */
+async function startRun(byName, exec, overrides = {}) {
+  await call('POST', '/longloop/run', { op: 'stop' }).catch(() => {})
+  await rm(join(workspace, '.longloop/run.json'), { force: true })
+  await byName('run_start').execute(
+    {
+      objective: overrides.objective ?? '把报告写出来',
+      acceptance: overrides.acceptance ?? [
+        { statement: '报告存在', command: 'test -f report.md' },
+        { statement: '有摘要', command: 'grep -q 摘要 report.md' },
+      ],
+    },
+    exec(),
+  )
+}
+
 async function withTools(shellResults = {}) {
   const { ctx, hooks: local } = makeCtx({ root: workspace, shellResults })
   apply(ctx, { driver: false })
@@ -987,18 +1003,7 @@ test('run_verify with criteria checks the subset and cannot complete the run', a
   const { byName, exec, hooks: local } = await withTools({ 'test -f report.md': { exitCode: 1, stdout: 'missing' } })
   // A fresh mount suspends armed runs (§4.2 A6), so the run is created *after*
   // the mount, which is also how a real session gets one.
-  await call('POST', '/longloop/run', { op: 'stop' })
-  await rm(join(workspace, '.longloop/run.json'), { force: true })
-  await byName('run_start').execute(
-    {
-      objective: '子集验证的靶子',
-      acceptance: [
-        { statement: '报告存在', command: 'test -f report.md' },
-        { statement: '有摘要', command: 'grep -q 摘要 report.md' },
-      ],
-    },
-    exec(),
-  )
+  await startRun(byName, exec)
   const value = await byName('run_verify').execute({ criteria: ['C1'] }, exec())
   assert.equal(value.status, 'fail', 'the fixture command exits 1')
   assert.equal(value.completed, false, 'a subset answer is never a completion')
@@ -1016,6 +1021,7 @@ test('run_verify with criteria checks the subset and cannot complete the run', a
 
 test('a full run_verify runs every frozen check and may complete the run', async () => {
   const { byName, exec, hooks: local } = await withTools()
+  await startRun(byName, exec)
   const value = await byName('run_verify').execute({}, exec())
   assert.equal(local.shellCalls.length, 2, 'both frozen checks ran')
   assert.equal(value.perCriterion.length, 2)
@@ -1028,6 +1034,7 @@ test('a full run_verify runs every frozen check and may complete the run', async
 
 test('run_handoff writes the package, returns it, and concludes the turn', async () => {
   const { byName, exec } = await withTools()
+  await startRun(byName, exec)
   let concluded = false
   const value = await byName('run_handoff').execute({}, exec({ concludeTurn: () => (concluded = true) }))
   assert.equal(concluded, true, 'the design marks run_handoff as concluding')
@@ -1046,10 +1053,46 @@ test('run_handoff writes the package, returns it, and concludes the turn', async
   assert.equal(state.handoff.reason, 'on-demand')
 })
 
+test('a run inherited from a dead process is suspended the first time anyone looks', async () => {
+  // The mount-time scan only sees workspaces the host already knows, and at boot
+  // that can be none of them; this is the lazy half of the same rule (§8.6/A6).
+  //
+  // Its own workspace on purpose: the other tests share one, and their
+  // fire-and-forget mount passes would race this run's file.
+  const own = await mkdtemp(join(tmpdir(), 'longloop-stale-'))
+  try {
+    const { ctx, hooks: local } = makeCtx({ root: own })
+    apply(ctx, { driver: false })
+    const runStart = local.tools.find((definition) => definition.name === 'run_start')
+    await runStart.execute({ objective: '上一个进程留下的运行', acceptance: ['随便一条'] }, { agent: { id: 'sess-1' } })
+
+    const file = join(own, '.longloop/run.json')
+    const fresh = JSON.parse(await readFile(file, 'utf8'))
+    assert.equal(fresh.state, 'armed')
+    // Backdate it: a run is inherited only when its last write predates this process.
+    await writeFile(file, `${JSON.stringify({ ...fresh, updatedAt: 1000, startedAt: 1000 }, null, 2)}\n`, 'utf8')
+
+    const res = makeRes()
+    await local.handler({ method: 'GET', url: `http://x/longloop/state?workspace=${encodeURIComponent(own)}` }, res)
+    const state = res.json()
+    assert.equal(state.run.state, 'suspended')
+    assert.match(state.run.suspendReason, /上一个进程|重新授权/)
+    const ledger = await readFile(join(own, '.longloop/ledger.jsonl'), 'utf8')
+    assert.match(ledger, /run-suspended/)
+    // And it stays suspended: looking twice must not resurrect it.
+    const again = makeRes()
+    await local.handler({ method: 'GET', url: `http://x/longloop/state?workspace=${encodeURIComponent(own)}` }, again)
+    assert.equal(again.json().run.state, 'suspended')
+  } finally {
+    await rm(own, { recursive: true, force: true })
+  }
+})
+
 test('a handoff carries the latest verdict, including a requested one', async () => {
   // A run whose only evidence is a subset verdict must not hand off as
   // "no verdict this round": that would hide the check that just failed.
   const { byName, exec } = await withTools({ 'test -f report.md': { exitCode: 1, stdout: 'missing' } })
+  await startRun(byName, exec)
   const run = JSON.parse(await readFile(join(workspace, '.longloop/run.json'), 'utf8'))
   await writeFile(
     join(workspace, '.longloop/run.json'),
